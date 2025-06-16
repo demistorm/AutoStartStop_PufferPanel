@@ -1,6 +1,6 @@
 {
-  "id": "autostart-puff",
-  "name": "PufferPanel AutoStartStop",
+  "id": "autostartstop",
+  "name": "AutoStartStop_PufferPanel",
   "version": "$version",
   "description": "$description",
   "url": "$url",

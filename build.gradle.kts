@@ -41,6 +41,7 @@ tasks {
     }
 
     shadowJar {
+        archiveBaseName.set("AutoStartStop_Pufferpanel")
         archiveClassifier.set("")
         relocate("okhttp3", "win.demistorm.pufferPanelAutoStartStop.okhttp3")
         relocate("org.spongepowered.configurate", "win.demistorm.pufferPanelAutoStartStop.configurate")

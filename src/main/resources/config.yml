@@ -8,8 +8,8 @@ inactivity-timeout-minutes: 30
 
 # Map Velocity server names to PufferPanel IDs
 server-map:
-  survival: pufferpanel-server-id-here
-  creative: pufferpanel-server-id-here
+  survival: "pufferpanel-server-id-here"
+  creative: "pufferpanel-server-id-here"
 
-
+# Want a bunch of extra info?
 debug: false

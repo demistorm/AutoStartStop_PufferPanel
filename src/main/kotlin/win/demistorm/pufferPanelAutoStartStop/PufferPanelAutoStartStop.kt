@@ -6,9 +6,7 @@ import com.velocitypowered.api.event.connection.DisconnectEvent
 import com.velocitypowered.api.event.player.ServerPreConnectEvent
 import com.velocitypowered.api.plugin.Plugin
 import com.velocitypowered.api.plugin.annotation.DataDirectory
-import com.velocitypowered.api.proxy.Player
 import com.velocitypowered.api.proxy.ProxyServer
-import com.velocitypowered.api.proxy.server.RegisteredServer
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
@@ -28,8 +26,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 @Plugin(
-    id = "autostart_puff",
-    name = "PufferPanel AutoStartStop",
+    id = "autostartstop",
+    name = "AutoStartStop_PufferPanel",
     version = BuildConstants.VERSION,
     description = "Automatically manages Minecraft server start/stop via PufferPanel API",
     authors = ["Halfstorm"]
@@ -45,12 +43,14 @@ class PufferPanelAutoStartStop @Inject constructor(
     private val serverInactivityTasks = ConcurrentHashMap<String, Job>()
     private val inactivityTimeoutMinutes: Long
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private lateinit var authManager: PufferPanelAuthManager
+    private var authManager: PufferPanelAuthManager
     private val debugEnabled: Boolean
     private val serverIdMap: Map<String, String>
     private val playersWaitingForServer = ConcurrentHashMap<String, MutableSet<UUID>>()
 
     init {
+
+        // Config initialization
         val configPath = dataDirectory.resolve("config.yml")
 
         Files.createDirectories(dataDirectory)
@@ -62,6 +62,7 @@ class PufferPanelAutoStartStop @Inject constructor(
             } ?: logger.warn("Default config.yml not found in resources!")
         }
 
+        // Build config.yml if for some reason doesn't exist
         val loader = YamlConfigurationLoader.builder()
             .path(configPath)
             .indent(2)
@@ -83,25 +84,27 @@ class PufferPanelAutoStartStop @Inject constructor(
             logger.warn("Default config created. Please set your PufferPanel details in config.yml")
         }
 
+        // Assign values to config options
         val clientId = config.node("client-id").getString("your-client-id-here") ?: "your-client-id-here"
         val clientSecret = config.node("client-secret").getString("your-client-secret-here") ?: "your-client-secret-here"
         val panelUrl = config.node("panel-url").getString("https://your.pufferpanel.domain") ?: "https://your.pufferpanel.domain"
-
         inactivityTimeoutMinutes = config.node("inactivity-timeout-minutes").getLong(30L)
         debugEnabled = config.node("debug").getBoolean(false)
-
         serverIdMap = config.node("server-map").childrenMap().entries.associate {
             it.key.toString() to it.value.string!!
         }
 
+        // Config debug messages
         debugLog("Loaded config: client-id=$clientId, panel-url=$panelUrl, timeout=$inactivityTimeoutMinutes, debug=$debugEnabled")
         debugLog("Loaded server mapping: $serverIdMap")
 
+        // Check for all Velocity servers
         proxy.allServers.forEach { server ->
             serverPlayerSet[server.serverInfo.name] = Collections.synchronizedSet(mutableSetOf())
             debugLog("Initialized player set for server: ${server.serverInfo.name}")
         }
 
+        // Connect to PufferPanel API
         authManager = PufferPanelAuthManager(panelUrl, clientId, clientSecret, httpClient, logger, debugEnabled)
 
         coroutineScope.launch {
@@ -116,6 +119,7 @@ class PufferPanelAutoStartStop @Inject constructor(
         logger.info("PufferPanel AutoStartStop plugin initialized.")
     }
 
+    // When player connects
     @Subscribe
     fun onServerPreConnect(event: ServerPreConnectEvent) {
         val player = event.player
@@ -127,10 +131,11 @@ class PufferPanelAutoStartStop @Inject constructor(
         val isServerAvailable = backendServer.isPresent && try {
             backendServer.get().ping().get(1, TimeUnit.SECONDS)
             true
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             false
         }
 
+        // If backend server is not online, start the server and send the player to a limbo server
         if (!isServerAvailable) {
             debugLog("Server $serverName is not responding. Sending ${player.username} to limbo.")
 
@@ -139,7 +144,7 @@ class PufferPanelAutoStartStop @Inject constructor(
 
             val limbo = proxy.getServer("limbo")
             if (limbo.isPresent) {
-                event.setResult(ServerPreConnectEvent.ServerResult.allowed(limbo.get()))
+                event.result = ServerPreConnectEvent.ServerResult.allowed(limbo.get())
                 player.sendMessage(Component.text("Server is starting... please wait in limbo.").color(NamedTextColor.YELLOW))
             } else {
                 player.sendMessage(Component.text("Server is offline and limbo is unavailable. Please try later.").color(NamedTextColor.RED))
@@ -158,6 +163,7 @@ class PufferPanelAutoStartStop @Inject constructor(
             return
         }
 
+        // Stop the server shutdown when player joins server
         val stopTask = serverInactivityTasks.remove(serverName)
         if (stopTask != null) {
             stopTask.cancel()
@@ -168,12 +174,15 @@ class PufferPanelAutoStartStop @Inject constructor(
         playerSet.add(player.uniqueId)
     }
 
+    // When player disconnects
     @Subscribe
     fun onPlayerDisconnect(event: DisconnectEvent) {
         val player = event.player
         proxy.allServers.forEach { server ->
             val name = server.serverInfo.name
             val set = serverPlayerSet[name]
+
+            // Schedule server shutdown for configured time
             if (set?.remove(player.uniqueId) == true) {
                 debugLog("Player ${player.username} disconnected from $name. Remaining: ${set.size}")
                 if (set.isEmpty()) {
@@ -188,12 +197,14 @@ class PufferPanelAutoStartStop @Inject constructor(
         }
     }
 
+    // Redirects players in limbo to requested server
     private suspend fun waitForServerAndTransferPlayers(serverName: String) {
         val backend = proxy.getServer(serverName).orElse(null) ?: return
         debugLog("Starting availability watch for $serverName...")
 
+        // Ping backend server to check if online
         repeat(60) { attempt ->
-            delay(3000)
+            delay(3000) // Check every 3 seconds
             try {
                 backend.ping().get(1, TimeUnit.SECONDS)
                 debugLog("Server $serverName is now responsive. Transferring players.")
@@ -211,6 +222,7 @@ class PufferPanelAutoStartStop @Inject constructor(
         debugLog("Timeout waiting for $serverName to come online.")
     }
 
+    // Sends request to PufferPanel to start server
     private suspend fun startPufferPanelServer(serverName: String) {
         val pufferId = serverIdMap[serverName] ?: return debugLog("No PufferPanel mapping found for server '$serverName'. Skipping start.")
         val token = authManager.getToken()
@@ -231,6 +243,7 @@ class PufferPanelAutoStartStop @Inject constructor(
         }
     }
 
+    // Sends request to PufferPanel to stop server
     private suspend fun stopPufferPanelServer(serverName: String) {
         val pufferId = serverIdMap[serverName] ?: return debugLog("No PufferPanel mapping found for server '$serverName'. Skipping stop.")
         val token = authManager.getToken()
@@ -256,6 +269,7 @@ class PufferPanelAutoStartStop @Inject constructor(
     }
 }
 
+// Handles PufferPanel authentication
 class PufferPanelAuthManager(
     val panelBaseUrl: String,
     private val clientId: String,
@@ -301,7 +315,7 @@ class PufferPanelAuthManager(
 
             token = accessToken
             expiryTimeMillis = now + (expiresIn * 1000) - 30_000
-            if (debugEnabled) logger.info("[PufferAuto DEBUG] New token fetched, valid for ${expiresIn} seconds.")
+            if (debugEnabled) logger.info("[PufferAuto DEBUG] New token fetched, valid for $expiresIn seconds.")
             accessToken
         }
     }
