@@ -47,6 +47,7 @@ class PufferPanelAutoStartStop @Inject constructor(
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private lateinit var authManager: PufferPanelAuthManager
     private val debugEnabled: Boolean
+    private val serverIdMap: Map<String, String>
 
     init {
         val configPath = dataDirectory.resolve("config.yml")
@@ -76,6 +77,7 @@ class PufferPanelAutoStartStop @Inject constructor(
             config.node("panel-url").set("https://your.pufferpanel.domain")
             config.node("inactivity-timeout-minutes").set(30)
             config.node("debug").set(false)
+            config.node("server-map", "survival").set("pufferpanel-server-id-here")
             loader.save(config)
             logger.warn("Default config created. Please set your PufferPanel details in config.yml")
         }
@@ -87,7 +89,12 @@ class PufferPanelAutoStartStop @Inject constructor(
         inactivityTimeoutMinutes = config.node("inactivity-timeout-minutes").getLong(30L)
         debugEnabled = config.node("debug").getBoolean(false)
 
+        serverIdMap = config.node("server-map").childrenMap().entries.associate {
+            it.key.toString() to it.value.string!!
+        }
+
         debugLog("Loaded config: client-id=$clientId, panel-url=$panelUrl, timeout=$inactivityTimeoutMinutes, debug=$debugEnabled")
+        debugLog("Loaded server mapping: $serverIdMap")
 
         proxy.allServers.forEach { server ->
             serverPlayerCounts[server.serverInfo.name] = 0
@@ -108,13 +115,52 @@ class PufferPanelAutoStartStop @Inject constructor(
         logger.info("PufferPanel AutoStartStop plugin initialized.")
     }
 
+    @Subscribe
+    fun onPlayerChooseServer(event: PlayerChooseInitialServerEvent) {
+        val serverName = event.initialServer.orElse(null)?.serverInfo?.name ?: return
+
+        coroutineScope.launch {
+            val count = serverPlayerCounts.compute(serverName) { _, v -> (v ?: 0) + 1 } ?: 1
+            debugLog("Player joining $serverName. Player count: $count")
+            if (count == 1) {
+                startPufferPanelServer(serverName)
+            }
+        }
+    }
+
+    private suspend fun startPufferPanelServer(serverName: String) {
+        val pufferId = serverIdMap[serverName]
+        if (pufferId == null) {
+            debugLog("No PufferPanel mapping found for server '$serverName'. Skipping start.")
+            return
+        }
+
+        val token = authManager.getToken()
+        val url = "${authManager.panelBaseUrl}/proxy/daemon/server/$pufferId/start"
+
+        val request = Request.Builder()
+            .url(url)
+            .post("".toRequestBody(null))
+            .addHeader("Authorization", "Bearer $token")
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                val responseBody = response.body?.string()
+                logger.error("Failed to start server '$serverName': ${response.code} ${response.message} - $responseBody")
+            } else {
+                debugLog("Successfully sent start request for '$serverName'")
+            }
+        }
+    }
+
     private fun debugLog(message: String) {
         if (debugEnabled) logger.info("[PufferAuto DEBUG] $message")
     }
 }
 
 class PufferPanelAuthManager(
-    private val panelBaseUrl: String,
+    val panelBaseUrl: String,
     private val clientId: String,
     private val clientSecret: String,
     private val httpClient: OkHttpClient,
@@ -158,7 +204,7 @@ class PufferPanelAuthManager(
 
             token = accessToken
             expiryTimeMillis = now + (expiresIn * 1000) - 30_000 // subtract 30s to refresh early
-            if (debugEnabled) logger.info("[PufferAuto DEBUG] New token fetched, valid for ${expiresIn} seconds.")
+            if (debugEnabled) logger.info("[PufferAuto DEBUG] New token fetched, valid for $expiresIn seconds.")
             accessToken
         }
     }

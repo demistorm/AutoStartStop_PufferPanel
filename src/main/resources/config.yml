@@ -6,4 +6,10 @@ client-secret: your-client-secret-here
 # How long the server should wait before stopping
 inactivity-timeout-minutes: 30
 
+# Map Velocity server names to PufferPanel IDs
+server-map:
+  survival: pufferpanel-server-id-here
+  creative: pufferpanel-server-id-here
+
+
 debug: false
