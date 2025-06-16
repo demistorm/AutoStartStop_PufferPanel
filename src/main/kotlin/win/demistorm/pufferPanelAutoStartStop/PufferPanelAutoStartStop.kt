@@ -134,11 +134,9 @@ class PufferPanelAutoStartStop @Inject constructor(
         if (!isServerAvailable) {
             debugLog("Server $serverName is not responding. Sending ${player.username} to limbo.")
 
-            // Add player to waitlist
             val waitingList = playersWaitingForServer.computeIfAbsent(serverName) { Collections.synchronizedSet(mutableSetOf()) }
             waitingList.add(player.uniqueId)
 
-            // Send to limbo
             val limbo = proxy.getServer("limbo")
             if (limbo.isPresent) {
                 event.setResult(ServerPreConnectEvent.ServerResult.allowed(limbo.get()))
@@ -155,33 +153,37 @@ class PufferPanelAutoStartStop @Inject constructor(
                         startPufferPanelServer(serverName)
                     }
                 }
-
-                // Wait for server to come online and transfer players
                 waitForServerAndTransferPlayers(serverName)
             }
-
             return
         }
 
-        // Server is available
+        val stopTask = serverInactivityTasks.remove(serverName)
+        if (stopTask != null) {
+            stopTask.cancel()
+            debugLog("Canceled stop countdown for $serverName due to ${player.username} joining.")
+        }
+
         debugLog("Server $serverName is online. Connecting ${player.username} normally.")
         playerSet.add(player.uniqueId)
     }
 
-
-
-
-
-
     @Subscribe
     fun onPlayerDisconnect(event: DisconnectEvent) {
         val player = event.player
-
         proxy.allServers.forEach { server ->
             val name = server.serverInfo.name
             val set = serverPlayerSet[name]
             if (set?.remove(player.uniqueId) == true) {
                 debugLog("Player ${player.username} disconnected from $name. Remaining: ${set.size}")
+                if (set.isEmpty()) {
+                    serverInactivityTasks[name]?.cancel()
+                    serverInactivityTasks[name] = coroutineScope.launch {
+                        delay(inactivityTimeoutMinutes * 60 * 1000)
+                        stopPufferPanelServer(name)
+                    }
+                    debugLog("Scheduled stop for $name in $inactivityTimeoutMinutes minutes.")
+                }
             }
         }
     }
@@ -191,36 +193,26 @@ class PufferPanelAutoStartStop @Inject constructor(
         debugLog("Starting availability watch for $serverName...")
 
         repeat(60) { attempt ->
-            delay(3000) // check every 3 seconds
+            delay(3000)
             try {
                 backend.ping().get(1, TimeUnit.SECONDS)
                 debugLog("Server $serverName is now responsive. Transferring players.")
-
                 val waitingPlayers = playersWaitingForServer.remove(serverName) ?: return
                 for (uuid in waitingPlayers) {
                     val player = proxy.getPlayer(uuid).orElse(null) ?: continue
                     player.createConnectionRequest(backend).fireAndForget()
                     player.sendMessage(Component.text("Server is ready! Connecting you now...").color(NamedTextColor.GREEN))
                 }
-
-                return // done
+                return
             } catch (_: Exception) {
                 debugLog("Ping attempt ${attempt + 1}/60 failed for $serverName.")
             }
         }
-
         debugLog("Timeout waiting for $serverName to come online.")
     }
 
-
-
     private suspend fun startPufferPanelServer(serverName: String) {
-        val pufferId = serverIdMap[serverName]
-        if (pufferId == null) {
-            debugLog("No PufferPanel mapping found for server '$serverName'. Skipping start.")
-            return
-        }
-
+        val pufferId = serverIdMap[serverName] ?: return debugLog("No PufferPanel mapping found for server '$serverName'. Skipping start.")
         val token = authManager.getToken()
         val url = "${authManager.panelBaseUrl}/proxy/daemon/server/$pufferId/start"
 
@@ -235,6 +227,26 @@ class PufferPanelAutoStartStop @Inject constructor(
                 logger.error("Failed to start server '$serverName': ${response.code} ${response.message}")
             } else {
                 debugLog("Successfully sent start request for '$serverName'")
+            }
+        }
+    }
+
+    private suspend fun stopPufferPanelServer(serverName: String) {
+        val pufferId = serverIdMap[serverName] ?: return debugLog("No PufferPanel mapping found for server '$serverName'. Skipping stop.")
+        val token = authManager.getToken()
+        val url = "${authManager.panelBaseUrl}/proxy/daemon/server/$pufferId/stop"
+
+        val request = Request.Builder()
+            .url(url)
+            .post("".toRequestBody(null))
+            .addHeader("Authorization", "Bearer $token")
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                logger.error("Failed to stop server '$serverName': ${response.code} ${response.message}")
+            } else {
+                debugLog("Successfully sent stop request for '$serverName'")
             }
         }
     }
@@ -288,7 +300,7 @@ class PufferPanelAuthManager(
             val expiresIn = json["expires_in"]?.jsonPrimitive?.int ?: 3600
 
             token = accessToken
-            expiryTimeMillis = now + (expiresIn * 1000) - 30_000 // subtract 30s to refresh early
+            expiryTimeMillis = now + (expiresIn * 1000) - 30_000
             if (debugEnabled) logger.info("[PufferAuto DEBUG] New token fetched, valid for ${expiresIn} seconds.")
             accessToken
         }
