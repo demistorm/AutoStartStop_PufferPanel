@@ -1,0 +1,9 @@
+# PufferPanel credentials
+panel-url: https://your.pufferpanel.domain
+client-id: your-client-id-here
+client-secret: your-client-secret-here
+
+# How long the server should wait before stopping
+inactivity-timeout-minutes: 30
+
+debug: false

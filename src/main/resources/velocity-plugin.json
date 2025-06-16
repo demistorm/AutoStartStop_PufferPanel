@@ -1,0 +1,12 @@
+{
+  "id": "autostart-puff",
+  "name": "PufferPanel AutoStartStop",
+  "version": "$version",
+  "description": "$description",
+  "url": "$url",
+  "authors": [
+    "Halfstorm"
+  ],
+  "dependencies": [],
+  "main": "win.demistorm.pufferPanelAutoStartStop.PufferPanelAutoStartStop"
+}
