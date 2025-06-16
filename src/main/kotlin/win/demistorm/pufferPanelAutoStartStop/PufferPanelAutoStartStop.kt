@@ -3,10 +3,10 @@ package win.demistorm.pufferPanelAutoStartStop
 import com.google.inject.Inject
 import com.velocitypowered.api.event.Subscribe
 import com.velocitypowered.api.event.connection.DisconnectEvent
-import com.velocitypowered.api.event.player.PlayerChooseInitialServerEvent
 import com.velocitypowered.api.event.player.ServerPreConnectEvent
 import com.velocitypowered.api.plugin.Plugin
 import com.velocitypowered.api.plugin.annotation.DataDirectory
+import com.velocitypowered.api.proxy.Player
 import com.velocitypowered.api.proxy.ProxyServer
 import com.velocitypowered.api.proxy.server.RegisteredServer
 import kotlinx.coroutines.*
@@ -41,13 +41,14 @@ class PufferPanelAutoStartStop @Inject constructor(
 ) {
     private val config: ConfigurationNode
     private val httpClient = OkHttpClient()
-    private val serverPlayerCounts = ConcurrentHashMap<String, Int>()
+    private val serverPlayerSet = ConcurrentHashMap<String, MutableSet<UUID>>()
     private val serverInactivityTasks = ConcurrentHashMap<String, Job>()
     private val inactivityTimeoutMinutes: Long
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private lateinit var authManager: PufferPanelAuthManager
     private val debugEnabled: Boolean
     private val serverIdMap: Map<String, String>
+    private val playersWaitingForServer = ConcurrentHashMap<String, MutableSet<UUID>>()
 
     init {
         val configPath = dataDirectory.resolve("config.yml")
@@ -97,8 +98,8 @@ class PufferPanelAutoStartStop @Inject constructor(
         debugLog("Loaded server mapping: $serverIdMap")
 
         proxy.allServers.forEach { server ->
-            serverPlayerCounts[server.serverInfo.name] = 0
-            debugLog("Initialized player count for server: ${server.serverInfo.name}")
+            serverPlayerSet[server.serverInfo.name] = Collections.synchronizedSet(mutableSetOf())
+            debugLog("Initialized player set for server: ${server.serverInfo.name}")
         }
 
         authManager = PufferPanelAuthManager(panelUrl, clientId, clientSecret, httpClient, logger, debugEnabled)
@@ -116,17 +117,102 @@ class PufferPanelAutoStartStop @Inject constructor(
     }
 
     @Subscribe
-    fun onPlayerChooseServer(event: PlayerChooseInitialServerEvent) {
-        val serverName = event.initialServer.orElse(null)?.serverInfo?.name ?: return
+    fun onServerPreConnect(event: ServerPreConnectEvent) {
+        val player = event.player
+        val serverName = event.originalServer.serverInfo.name
 
-        coroutineScope.launch {
-            val count = serverPlayerCounts.compute(serverName) { _, v -> (v ?: 0) + 1 } ?: 1
-            debugLog("Player joining $serverName. Player count: $count")
-            if (count == 1) {
-                startPufferPanelServer(serverName)
+        val playerSet = serverPlayerSet.computeIfAbsent(serverName) { Collections.synchronizedSet(mutableSetOf()) }
+
+        val backendServer = proxy.getServer(serverName)
+        val isServerAvailable = backendServer.isPresent && try {
+            backendServer.get().ping().get(1, TimeUnit.SECONDS)
+            true
+        } catch (e: Exception) {
+            false
+        }
+
+        if (!isServerAvailable) {
+            debugLog("Server $serverName is not responding. Sending ${player.username} to limbo.")
+
+            // Add player to waitlist
+            val waitingList = playersWaitingForServer.computeIfAbsent(serverName) { Collections.synchronizedSet(mutableSetOf()) }
+            waitingList.add(player.uniqueId)
+
+            // Send to limbo
+            val limbo = proxy.getServer("limbo")
+            if (limbo.isPresent) {
+                event.setResult(ServerPreConnectEvent.ServerResult.allowed(limbo.get()))
+                player.sendMessage(Component.text("Server is starting... please wait in limbo.").color(NamedTextColor.YELLOW))
+            } else {
+                player.sendMessage(Component.text("Server is offline and limbo is unavailable. Please try later.").color(NamedTextColor.RED))
+            }
+
+            coroutineScope.launch {
+                if (!playerSet.contains(player.uniqueId)) {
+                    playerSet.add(player.uniqueId)
+                    debugLog("Queued ${player.username} for $serverName. Count: ${playerSet.size}")
+                    if (playerSet.size == 1) {
+                        startPufferPanelServer(serverName)
+                    }
+                }
+
+                // Wait for server to come online and transfer players
+                waitForServerAndTransferPlayers(serverName)
+            }
+
+            return
+        }
+
+        // Server is available
+        debugLog("Server $serverName is online. Connecting ${player.username} normally.")
+        playerSet.add(player.uniqueId)
+    }
+
+
+
+
+
+
+    @Subscribe
+    fun onPlayerDisconnect(event: DisconnectEvent) {
+        val player = event.player
+
+        proxy.allServers.forEach { server ->
+            val name = server.serverInfo.name
+            val set = serverPlayerSet[name]
+            if (set?.remove(player.uniqueId) == true) {
+                debugLog("Player ${player.username} disconnected from $name. Remaining: ${set.size}")
             }
         }
     }
+
+    private suspend fun waitForServerAndTransferPlayers(serverName: String) {
+        val backend = proxy.getServer(serverName).orElse(null) ?: return
+        debugLog("Starting availability watch for $serverName...")
+
+        repeat(60) { attempt ->
+            delay(3000) // check every 3 seconds
+            try {
+                backend.ping().get(1, TimeUnit.SECONDS)
+                debugLog("Server $serverName is now responsive. Transferring players.")
+
+                val waitingPlayers = playersWaitingForServer.remove(serverName) ?: return
+                for (uuid in waitingPlayers) {
+                    val player = proxy.getPlayer(uuid).orElse(null) ?: continue
+                    player.createConnectionRequest(backend).fireAndForget()
+                    player.sendMessage(Component.text("Server is ready! Connecting you now...").color(NamedTextColor.GREEN))
+                }
+
+                return // done
+            } catch (_: Exception) {
+                debugLog("Ping attempt ${attempt + 1}/60 failed for $serverName.")
+            }
+        }
+
+        debugLog("Timeout waiting for $serverName to come online.")
+    }
+
+
 
     private suspend fun startPufferPanelServer(serverName: String) {
         val pufferId = serverIdMap[serverName]
@@ -146,8 +232,7 @@ class PufferPanelAutoStartStop @Inject constructor(
 
         httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
-                val responseBody = response.body?.string()
-                logger.error("Failed to start server '$serverName': ${response.code} ${response.message} - $responseBody")
+                logger.error("Failed to start server '$serverName': ${response.code} ${response.message}")
             } else {
                 debugLog("Successfully sent start request for '$serverName'")
             }
@@ -204,7 +289,7 @@ class PufferPanelAuthManager(
 
             token = accessToken
             expiryTimeMillis = now + (expiresIn * 1000) - 30_000 // subtract 30s to refresh early
-            if (debugEnabled) logger.info("[PufferAuto DEBUG] New token fetched, valid for $expiresIn seconds.")
+            if (debugEnabled) logger.info("[PufferAuto DEBUG] New token fetched, valid for ${expiresIn} seconds.")
             accessToken
         }
     }
